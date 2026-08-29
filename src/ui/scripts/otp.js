@@ -351,6 +351,350 @@ export function getOTPCode() {
     // 创建全局OTP计算器实例
     const otpCalculator = new OTPCalculator();
 
+    // 保存每个验证码节点最近一次成功提交的窗口，避免首次加载或重复刷新时误触发动效
+    const otpTransitionStates = new WeakMap();
+    const otpAnimationTimers = new WeakMap();
+    const activeOTPAnimationRecords = new Set();
+    const OTP_PLACEHOLDER = '------';
+    const OTP_ANIMATION_STORAGE_KEY = '2fa-otp-animation';
+    const OTP_ANIMATION_DEFAULT = 'none';
+    const OTP_ANIMATION_CONFIG = Object.freeze({
+      flow: Object.freeze({
+        currentClass: 'otp-promote-current',
+        nextClass: 'otp-promote-next',
+        duration: 420,
+        flyerClass: 'otp-promotion-flyer-active',
+        flyerStyle: 'target',
+        needsTargetGeometry: true,
+        usesTravelPath: true
+      }),
+      flip: Object.freeze({
+        currentClass: 'otp-promote-flip-current',
+        nextClass: 'otp-promote-flip-next',
+        duration: 520,
+        flyerClass: 'otp-promotion-flyer-flip',
+        flyerStyle: 'source',
+        needsTargetGeometry: false,
+        usesTravelPath: false
+      }),
+      spotlight: Object.freeze({
+        currentClass: 'otp-promote-spotlight-current',
+        nextClass: 'otp-promote-spotlight-next',
+        duration: 460,
+        flyerClass: 'otp-promotion-flyer-spotlight',
+        flyerStyle: 'source',
+        needsTargetGeometry: false,
+        usesTravelPath: false
+      }),
+      none: null
+    });
+    const OTP_ANIMATION_ALIASES = Object.freeze({ fade: 'spotlight' });
+    let otpAnimationMode = OTP_ANIMATION_DEFAULT;
+
+    function normalizeOTPAnimationMode(mode) {
+      const normalizedMode = typeof mode === 'string' ? mode.trim().toLowerCase() : '';
+      const canonicalMode = OTP_ANIMATION_ALIASES[normalizedMode] || normalizedMode;
+      return Object.prototype.hasOwnProperty.call(OTP_ANIMATION_CONFIG, canonicalMode)
+        ? canonicalMode
+        : OTP_ANIMATION_DEFAULT;
+    }
+
+    try {
+      otpAnimationMode = normalizeOTPAnimationMode(localStorage.getItem(OTP_ANIMATION_STORAGE_KEY));
+    } catch {
+      // localStorage 不可用时保留本次会话内的默认动效
+    }
+
+    function getOTPAnimationMode() {
+      return otpAnimationMode;
+    }
+
+    function setOTPAnimationMode(mode) {
+      const nextMode = normalizeOTPAnimationMode(mode);
+      otpAnimationMode = nextMode;
+
+      try {
+        localStorage.setItem(OTP_ANIMATION_STORAGE_KEY, nextMode);
+      } catch {
+        // localStorage 不可用时仍让选择在本次会话生效
+      }
+
+      // 用户切换设置时立即停止仍在播放的旧动效
+      activeOTPAnimationRecords.forEach(record => clearOTPAnimationRecord(record));
+      return nextMode;
+    }
+
+    function prefersReducedOTPMotion() {
+      try {
+        return !!(
+          typeof window !== 'undefined' &&
+          typeof window.matchMedia === 'function' &&
+          window.matchMedia('(prefers-reduced-motion: reduce)').matches
+        );
+      } catch {
+        return false;
+      }
+    }
+
+    function canAnimateOTPElement(element) {
+      return !!(
+        element &&
+        element.parentElement &&
+        element.classList &&
+        typeof element.classList.add === 'function' &&
+        typeof element.classList.remove === 'function'
+      );
+    }
+
+    function clearOTPAnimationTimer(element) {
+      if (!element) return;
+
+      const animationRecord = otpAnimationTimers.get(element);
+      if (animationRecord) clearOTPAnimationRecord(animationRecord);
+    }
+
+    function clearOTPAnimationRecord(animationRecord) {
+      if (!animationRecord || animationRecord.cleared) return;
+      animationRecord.cleared = true;
+
+      if (
+        animationRecord.timerId !== null &&
+        typeof animationRecord.timerId !== 'undefined' &&
+        typeof clearTimeout === 'function'
+      ) {
+        clearTimeout(animationRecord.timerId);
+      }
+
+      animationRecord.entries.forEach(({ element, className }) => {
+        removeOTPAnimationClass(element, className);
+        if (otpAnimationTimers.get(element) === animationRecord) {
+          otpAnimationTimers.delete(element);
+        }
+      });
+      removeOTPPromotionFlyer(animationRecord.flyer);
+      activeOTPAnimationRecords.delete(animationRecord);
+    }
+
+    function removeOTPAnimationClass(element, className) {
+      if (!element || !element.classList || typeof element.classList.remove !== 'function') return;
+
+      try {
+        element.classList.remove(className);
+      } catch {
+        // 某些测试或嵌入环境可能提供不完整的 classList，实现上忽略清理失败
+      }
+    }
+
+    function removeOTPPromotionFlyer(flyer) {
+      if (!flyer) return;
+
+      try {
+        if (typeof flyer.remove === 'function') {
+          flyer.remove();
+        } else if (flyer.parentNode && typeof flyer.parentNode.removeChild === 'function') {
+          flyer.parentNode.removeChild(flyer);
+        }
+      } catch {
+        // 动画层已脱离文档时忽略清理异常
+      }
+    }
+
+    function getOTPTextRect(element) {
+      if (!element || typeof element.getBoundingClientRect !== 'function') return null;
+
+      try {
+        if (typeof document !== 'undefined' && typeof document.createRange === 'function' && element.firstChild) {
+          const range = document.createRange();
+          range.selectNodeContents(element);
+          const textRect = range.getBoundingClientRect();
+          if (textRect && textRect.width > 0 && textRect.height > 0) {
+            return textRect;
+          }
+        }
+      } catch {
+        // 非浏览器 DOM 或文本节点不可测量时回退到元素盒模型
+      }
+
+      try {
+        const elementRect = element.getBoundingClientRect();
+        if (elementRect && elementRect.width > 0 && elementRect.height > 0) {
+          return elementRect;
+        }
+      } catch {
+        // 某些嵌入环境不提供布局信息
+      }
+
+      return null;
+    }
+
+    function captureOTPPromotionGeometry(otpElement, nextOtpElement, needsTargetGeometry = true) {
+      const sourceRect = getOTPTextRect(nextOtpElement);
+      const targetRect = needsTargetGeometry ? getOTPTextRect(otpElement) : null;
+      if (!sourceRect || (needsTargetGeometry && !targetRect)) return null;
+
+      const sourceCenterX = sourceRect.left + sourceRect.width / 2;
+      const sourceCenterY = sourceRect.top + sourceRect.height / 2;
+      const targetCenterX = targetRect ? targetRect.left + targetRect.width / 2 : sourceCenterX;
+      const targetCenterY = targetRect ? targetRect.top + targetRect.height / 2 : sourceCenterY;
+      const startScale = targetRect && targetRect.width > 0
+        ? Math.min(1, Math.max(0.35, sourceRect.width / targetRect.width))
+        : 1;
+
+      let currentStyle = null;
+      let sourceStyle = null;
+      if (typeof getComputedStyle === 'function') {
+        try {
+          currentStyle = getComputedStyle(otpElement);
+        } catch {
+          currentStyle = null;
+        }
+        try {
+          sourceStyle = getComputedStyle(nextOtpElement);
+        } catch {
+          sourceStyle = null;
+        }
+      }
+
+      return {
+        sourceCenterX,
+        sourceCenterY,
+        deltaX: targetCenterX - sourceCenterX,
+        deltaY: targetCenterY - sourceCenterY,
+        startScale,
+        currentStyle,
+        sourceStyle
+      };
+    }
+
+    function createOTPPromotionFlyer(
+      token,
+      geometry,
+      animationClass,
+      styleType = 'target',
+      usesTravelPath = true
+    ) {
+      if (
+        !geometry ||
+        !animationClass ||
+        typeof document === 'undefined' ||
+        !document.body ||
+        typeof document.createElement !== 'function'
+      ) {
+        return null;
+      }
+
+      let flyer = null;
+      try {
+        flyer = document.createElement('span');
+        flyer.className = 'otp-promotion-flyer';
+        flyer.textContent = token;
+        if (typeof flyer.setAttribute === 'function') {
+          flyer.setAttribute('aria-hidden', 'true');
+        }
+
+        if (flyer.style) {
+          flyer.style.left = geometry.sourceCenterX + 'px';
+          flyer.style.top = geometry.sourceCenterY + 'px';
+          flyer.style.position = 'fixed';
+          flyer.style.pointerEvents = 'none';
+          flyer.style.userSelect = 'none';
+          if (usesTravelPath) {
+            flyer.style.setProperty('--otp-fly-x', geometry.deltaX + 'px');
+            flyer.style.setProperty('--otp-fly-y', geometry.deltaY + 'px');
+            flyer.style.setProperty('--otp-fly-start-scale', String(geometry.startScale));
+          }
+
+          const animationStyle = styleType === 'source' ? geometry.sourceStyle : geometry.currentStyle;
+          if (animationStyle) {
+            ['fontFamily', 'fontSize', 'fontWeight', 'fontVariantNumeric', 'letterSpacing', 'lineHeight', 'color'].forEach(property => {
+              if (animationStyle[property]) {
+                flyer.style[property] = animationStyle[property];
+              }
+            });
+          }
+        }
+
+        document.body.appendChild(flyer);
+        if (!flyer.classList || typeof flyer.classList.add !== 'function') {
+          removeOTPPromotionFlyer(flyer);
+          return null;
+        }
+        try {
+          void flyer.offsetWidth;
+        } catch {
+          // 测试节点或非布局环境没有 offsetWidth
+        }
+        flyer.classList.add(animationClass);
+        return flyer;
+      } catch {
+        removeOTPPromotionFlyer(flyer);
+        return null;
+      }
+    }
+
+    // 通过移除、重排、重新添加 class 让同一节点上的 CSS 动画可以重复播放
+    function triggerOTPPromotionAnimation(otpElement, nextOtpElement, previousNextToken, animationMode, geometry) {
+      const animationConfig = OTP_ANIMATION_CONFIG[animationMode];
+      if (!animationConfig || !geometry) return;
+
+      const entries = [];
+      if (canAnimateOTPElement(otpElement)) {
+        entries.push({ element: otpElement, className: animationConfig.currentClass });
+      }
+      if (canAnimateOTPElement(nextOtpElement)) {
+        entries.push({ element: nextOtpElement, className: animationConfig.nextClass });
+      }
+      if (entries.length === 0) return;
+
+      entries.forEach(({ element, className }) => {
+        clearOTPAnimationTimer(element);
+        removeOTPAnimationClass(element, className);
+      });
+
+      entries.forEach(({ element }) => {
+        try {
+          // parentElement 检查在 canAnimateOTPElement 中完成；读取 offsetWidth 强制浏览器提交上一次样式
+          void element.parentElement.offsetWidth;
+        } catch {
+          // detached 或测试节点没有可读的布局属性时仍继续添加 class
+        }
+      });
+
+      entries.forEach(({ element, className }) => {
+        try {
+          element.classList.add(className);
+        } catch {
+          // 防御性处理不完整的 DOM mock
+        }
+      });
+
+      const flyer = createOTPPromotionFlyer(
+        previousNextToken,
+        geometry,
+        animationConfig.flyerClass,
+        animationConfig.flyerStyle,
+        animationConfig.usesTravelPath
+      );
+      if (!flyer) {
+        entries.forEach(({ element, className }) => removeOTPAnimationClass(element, className));
+        return;
+      }
+      if (typeof setTimeout !== 'function') {
+        entries.forEach(({ element, className }) => removeOTPAnimationClass(element, className));
+        removeOTPPromotionFlyer(flyer);
+        return;
+      }
+
+      // 先登记记录再创建定时器，兼容测试环境中同步执行 setTimeout 回调的实现
+      const animationRecord = { timerId: null, flyer, entries, cleared: false };
+      entries.forEach(({ element }) => otpAnimationTimers.set(element, animationRecord));
+      activeOTPAnimationRecords.add(animationRecord);
+      animationRecord.timerId = setTimeout(
+        () => clearOTPAnimationRecord(animationRecord),
+        animationConfig.duration
+      );
+    }
+
     // 更新OTP显示
     async function updateOTP(secretId) {
       const secret = secrets.find(s => s.id === secretId);
@@ -379,18 +723,67 @@ export function getOTPCode() {
           }
         }
 
-        // 更新当前OTP显示
+        // 在提交前读取旧的下一个验证码，用于确认它是否正好晋升为当前验证码
         const otpElement = document.getElementById('otp-' + secretId);
+        const nextOtpElement = document.getElementById('next-otp-' + secretId);
+        const previousNextToken = nextOtpElement ? nextOtpElement.textContent : null;
+        const previousTransitionState = !isHOTP && otpElement ? otpTransitionStates.get(otpElement) : null;
+        const animationMode = getOTPAnimationMode();
+
+        const isOTPWindowPromotion = !!(
+          !isHOTP &&
+          otpElement &&
+          nextOtpElement &&
+          previousTransitionState &&
+          previousTransitionState.window === currentWindow - 1 &&
+          previousTransitionState.period === timeStep &&
+          previousTransitionState.nextToken === previousNextToken &&
+          previousNextToken !== OTP_PLACEHOLDER &&
+          currentToken !== OTP_PLACEHOLDER &&
+          nextToken !== OTP_PLACEHOLDER &&
+          previousNextToken === currentToken
+        );
+        const shouldAnimatePromotion = !!(
+          isOTPWindowPromotion &&
+          animationMode !== 'none' &&
+          !prefersReducedOTPMotion()
+        );
+        const promotionGeometry = shouldAnimatePromotion
+          ? captureOTPPromotionGeometry(
+              otpElement,
+              nextOtpElement,
+              OTP_ANIMATION_CONFIG[animationMode].needsTargetGeometry
+            )
+          : null;
+
+        // 更新当前OTP显示
         if (otpElement) {
           otpElement.textContent = currentToken;
           console.log('当前OTP更新:', currentToken, '时间窗口:', currentWindow);
         }
 
         // 更新下一个OTP显示
-        const nextOtpElement = document.getElementById('next-otp-' + secretId);
         if (nextOtpElement) {
           nextOtpElement.textContent = nextToken;
           console.log('下一个OTP更新:', nextToken, '时间窗口:', nextWindow);
+        }
+
+        if (!isHOTP && otpElement && nextOtpElement) {
+          otpTransitionStates.set(otpElement, {
+            window: currentWindow,
+            period: timeStep,
+            nextToken
+          });
+
+          if (shouldAnimatePromotion && promotionGeometry) {
+            triggerOTPPromotionAnimation(
+              otpElement,
+              nextOtpElement,
+              previousNextToken,
+              animationMode,
+              promotionGeometry
+            );
+          }
         }
       } catch (error) {
         console.error('更新OTP失败:', error);
