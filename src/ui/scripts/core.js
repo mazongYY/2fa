@@ -302,6 +302,14 @@ export function getCoreCode() {
       const secretsList = document.getElementById('secretsList');
       const emptyState = document.getElementById('emptyState');
 
+      // 重绘会替换 OTP 节点；先取消旧节点上的排队/播放动效，避免 flyer 残留或异步回调命中脱离节点。
+      if (typeof clearAllOTPAnimations === 'function') {
+        clearAllOTPAnimations();
+      }
+      if (typeof clearOTPWindowScheduler === 'function') {
+        clearOTPWindowScheduler();
+      }
+
       loading.style.display = 'none';
 
       if (currentSearchQuery && filteredSecrets.length === 0) {
@@ -894,8 +902,11 @@ export function getCoreCode() {
           
           if (lastRefreshWindow !== currentWindow) {
             console.log('🔄 [安全检查] 时间窗口已切换，刷新验证码:', secret.name, '窗口:', currentWindow);
-            updateOTP(secret.id);
             window[lastRefreshKey] = currentWindow;
+            // 共享窗口调度器负责可见卡片的统一刷新；仅在其不可用时走单卡兜底。
+            if (typeof isOTPWindowScheduled !== 'function' || !isOTPWindowScheduled(secret.id)) {
+              updateOTP(secret.id);
+            }
           }
         }
       });

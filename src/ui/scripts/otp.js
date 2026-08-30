@@ -355,6 +355,17 @@ export function getOTPCode() {
     const otpTransitionStates = new WeakMap();
     const otpAnimationTimers = new WeakMap();
     const activeOTPAnimationRecords = new Set();
+    // 同一帧内完成的多个交接统一读取布局、再一起写入 class，避免卡片之间出现明显时差
+    const queuedOTPAnimationJobs = new Set();
+    const otpQueuedAnimationJobs = new WeakMap();
+    // updateOTP 可能同时被倒计时、安全检查和焦点恢复触发；相同窗口只保留一个计算请求
+    const otpUpdateInFlight = new Map();
+    let otpUpdateRequestGeneration = 0;
+    // 每张卡仍保留自己的进度条定时器，但验证码窗口切换由一个共享调度器触发
+    const otpWindowSchedulerEntries = new Map();
+    let otpWindowSchedulerTimer = null;
+    let otpWindowSchedulerRunning = false;
+    const OTP_WINDOW_SCHEDULER_TICK_MS = 250;
     const OTP_PLACEHOLDER = '------';
     const OTP_ANIMATION_STORAGE_KEY = '2fa-otp-animation';
     const OTP_ANIMATION_DEFAULT = 'none';
@@ -390,6 +401,8 @@ export function getOTPCode() {
     });
     const OTP_ANIMATION_ALIASES = Object.freeze({ fade: 'spotlight' });
     let otpAnimationMode = OTP_ANIMATION_DEFAULT;
+    let otpAnimationReadFrameId = null;
+    let otpAnimationReadFrameScheduled = false;
 
     function normalizeOTPAnimationMode(mode) {
       const normalizedMode = typeof mode === 'string' ? mode.trim().toLowerCase() : '';
@@ -419,8 +432,8 @@ export function getOTPCode() {
         // localStorage 不可用时仍让选择在本次会话生效
       }
 
-      // 用户切换设置时立即停止仍在播放的旧动效
-      activeOTPAnimationRecords.forEach(record => clearOTPAnimationRecord(record));
+      // 用户切换设置时立即停止排队中或仍在播放的旧动效
+      clearAllOTPAnimations();
       return nextMode;
     }
 
@@ -437,20 +450,120 @@ export function getOTPCode() {
     }
 
     function canAnimateOTPElement(element) {
-      return !!(
+      const hasAnimationAPI = !!(
         element &&
         element.parentElement &&
         element.classList &&
         typeof element.classList.add === 'function' &&
         typeof element.classList.remove === 'function'
       );
+      if (!hasAnimationAPI) return false;
+      // DOM 重绘后旧节点可能仍被异步结果引用；不要给脱离文档的节点加动画
+      return !('isConnected' in element) || element.isConnected;
+    }
+
+    function isOTPAnimationDocumentVisible() {
+      return typeof document === 'undefined' || document.hidden !== true;
+    }
+
+    function isOTPElementInViewport(element) {
+      if (!isOTPAnimationDocumentVisible() || !element || typeof element.getBoundingClientRect !== 'function') {
+        return false;
+      }
+
+      try {
+        const rect = element.getBoundingClientRect();
+        if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+
+        const documentElement = typeof document !== 'undefined' ? document.documentElement : null;
+        const viewportWidth = typeof window !== 'undefined' && Number.isFinite(window.innerWidth)
+          ? window.innerWidth
+          : (documentElement && documentElement.clientWidth) || 0;
+        const viewportHeight = typeof window !== 'undefined' && Number.isFinite(window.innerHeight)
+          ? window.innerHeight
+          : (documentElement && documentElement.clientHeight) || 0;
+        if (viewportWidth <= 0 || viewportHeight <= 0) return true;
+
+        const right = Number.isFinite(rect.right) ? rect.right : rect.left + rect.width;
+        const bottom = Number.isFinite(rect.bottom) ? rect.bottom : rect.top + rect.height;
+        return right > 0 && bottom > 0 && rect.left < viewportWidth && rect.top < viewportHeight;
+      } catch {
+        return false;
+      }
+    }
+
+    function requestOTPAnimationFrame(callback) {
+      if (
+        typeof window !== 'undefined' &&
+        typeof window.requestAnimationFrame === 'function'
+      ) {
+        return window.requestAnimationFrame(callback);
+      }
+
+      // 非浏览器或测试环境没有布局帧，直接执行以保持功能可用
+      callback();
+      return null;
+    }
+
+    function cancelOTPAnimationFrame(frameId) {
+      if (
+        frameId !== null &&
+        typeof window !== 'undefined' &&
+        typeof window.cancelAnimationFrame === 'function'
+      ) {
+        window.cancelAnimationFrame(frameId);
+      }
+    }
+
+    function detachQueuedOTPAnimationJob(animationJob) {
+      if (!animationJob) return;
+      queuedOTPAnimationJobs.delete(animationJob);
+      (animationJob.elements || []).forEach(element => {
+        if (otpQueuedAnimationJobs.get(element) === animationJob) {
+          otpQueuedAnimationJobs.delete(element);
+        }
+      });
+    }
+
+    function removeQueuedOTPAnimationJob(animationJob) {
+      if (!animationJob || animationJob.cancelled) return;
+      animationJob.cancelled = true;
+      detachQueuedOTPAnimationJob(animationJob);
+      if (queuedOTPAnimationJobs.size === 0 && otpAnimationReadFrameScheduled) {
+        cancelOTPAnimationFrame(otpAnimationReadFrameId);
+        otpAnimationReadFrameId = null;
+        otpAnimationReadFrameScheduled = false;
+      }
     }
 
     function clearOTPAnimationTimer(element) {
       if (!element) return;
 
+      const queuedJob = otpQueuedAnimationJobs.get(element);
+      if (queuedJob) removeQueuedOTPAnimationJob(queuedJob);
+
       const animationRecord = otpAnimationTimers.get(element);
       if (animationRecord) clearOTPAnimationRecord(animationRecord);
+    }
+
+    function clearAllOTPAnimations() {
+      cancelOTPAnimationFrame(otpAnimationReadFrameId);
+      otpAnimationReadFrameId = null;
+      otpAnimationReadFrameScheduled = false;
+
+      [...queuedOTPAnimationJobs].forEach(job => removeQueuedOTPAnimationJob(job));
+      [...activeOTPAnimationRecords].forEach(record => clearOTPAnimationRecord(record));
+    }
+
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+          clearAllOTPAnimations();
+          stopOTPWindowScheduler();
+        } else if (otpWindowSchedulerEntries.size > 0) {
+          startOTPWindowScheduler();
+        }
+      });
     }
 
     function clearOTPAnimationRecord(animationRecord) {
@@ -569,13 +682,11 @@ export function getOTPCode() {
     function createOTPPromotionFlyer(
       token,
       geometry,
-      animationClass,
       styleType = 'target',
       usesTravelPath = true
     ) {
       if (
         !geometry ||
-        !animationClass ||
         typeof document === 'undefined' ||
         !document.body ||
         typeof document.createElement !== 'function'
@@ -619,12 +730,6 @@ export function getOTPCode() {
           removeOTPPromotionFlyer(flyer);
           return null;
         }
-        try {
-          void flyer.offsetWidth;
-        } catch {
-          // 测试节点或非布局环境没有 offsetWidth
-        }
-        flyer.classList.add(animationClass);
         return flyer;
       } catch {
         removeOTPPromotionFlyer(flyer);
@@ -632,60 +737,63 @@ export function getOTPCode() {
       }
     }
 
-    // 通过移除、重排、重新添加 class 让同一节点上的 CSS 动画可以重复播放
-    function triggerOTPPromotionAnimation(otpElement, nextOtpElement, previousNextToken, animationMode, geometry) {
-      const animationConfig = OTP_ANIMATION_CONFIG[animationMode];
-      if (!animationConfig || !geometry) return;
-
-      const entries = [];
-      if (canAnimateOTPElement(otpElement)) {
-        entries.push({ element: otpElement, className: animationConfig.currentClass });
+    function isOTPAnimationJobCurrent(animationJob) {
+      if (
+        !animationJob ||
+        animationJob.cancelled ||
+        getOTPAnimationMode() !== animationJob.animationMode ||
+        (!animationJob.isHOTP && getTrustedClockGeneration() !== animationJob.clockGeneration) ||
+        !canAnimateOTPElement(animationJob.otpElement) ||
+        !canAnimateOTPElement(animationJob.nextOtpElement) ||
+        animationJob.otpElement.textContent !== animationJob.currentToken ||
+        animationJob.nextOtpElement.textContent !== animationJob.nextToken ||
+        otpCalculator.getCurrentTimeWindow(animationJob.period) !== animationJob.window
+      ) {
+        return false;
       }
-      if (canAnimateOTPElement(nextOtpElement)) {
-        entries.push({ element: nextOtpElement, className: animationConfig.nextClass });
-      }
-      if (entries.length === 0) return;
 
-      entries.forEach(({ element, className }) => {
-        clearOTPAnimationTimer(element);
-        removeOTPAnimationClass(element, className);
-      });
+      const transitionState = otpTransitionStates.get(animationJob.otpElement);
+      return !!(
+        transitionState &&
+        transitionState.window === animationJob.window &&
+        transitionState.period === animationJob.period &&
+        transitionState.nextToken === animationJob.nextToken
+      );
+    }
 
-      entries.forEach(({ element }) => {
-        try {
-          // parentElement 检查在 canAnimateOTPElement 中完成；读取 offsetWidth 强制浏览器提交上一次样式
-          void element.parentElement.offsetWidth;
-        } catch {
-          // detached 或测试节点没有可读的布局属性时仍继续添加 class
-        }
-      });
+    // 在同一个布局帧中先读取所有卡片几何，再统一添加 class，保证交接起始时间一致
+    function startOTPPromotionAnimation(animationJob, geometry) {
+      const animationConfig = OTP_ANIMATION_CONFIG[animationJob.animationMode];
+      if (!animationConfig || !geometry || !isOTPAnimationJobCurrent(animationJob)) return;
 
-      entries.forEach(({ element, className }) => {
-        try {
-          element.classList.add(className);
-        } catch {
-          // 防御性处理不完整的 DOM mock
-        }
-      });
+      const entries = [
+        { element: animationJob.otpElement, className: animationConfig.currentClass },
+        { element: animationJob.nextOtpElement, className: animationConfig.nextClass }
+      ];
 
       const flyer = createOTPPromotionFlyer(
-        previousNextToken,
+        animationJob.previousNextToken,
         geometry,
-        animationConfig.flyerClass,
         animationConfig.flyerStyle,
         animationConfig.usesTravelPath
       );
-      if (!flyer) {
+      if (!flyer) return;
+
+      try {
+        entries.forEach(({ element, className }) => element.classList.add(className));
+        flyer.classList.add(animationConfig.flyerClass);
+      } catch {
         entries.forEach(({ element, className }) => removeOTPAnimationClass(element, className));
+        removeOTPPromotionFlyer(flyer);
         return;
       }
+
       if (typeof setTimeout !== 'function') {
         entries.forEach(({ element, className }) => removeOTPAnimationClass(element, className));
         removeOTPPromotionFlyer(flyer);
         return;
       }
 
-      // 先登记记录再创建定时器，兼容测试环境中同步执行 setTimeout 回调的实现
       const animationRecord = { timerId: null, flyer, entries, cleared: false };
       entries.forEach(({ element }) => otpAnimationTimers.set(element, animationRecord));
       activeOTPAnimationRecords.add(animationRecord);
@@ -695,99 +803,454 @@ export function getOTPCode() {
       );
     }
 
-    // 更新OTP显示
-    async function updateOTP(secretId) {
+    function flushQueuedOTPAnimations() {
+      otpAnimationReadFrameId = null;
+      otpAnimationReadFrameScheduled = false;
+      const animationJobs = [...queuedOTPAnimationJobs];
+      animationJobs.forEach(job => detachQueuedOTPAnimationJob(job));
+
+      if (!isOTPAnimationDocumentVisible() || prefersReducedOTPMotion()) {
+        animationJobs.forEach(job => { job.cancelled = true; });
+        return;
+      }
+
+      const preparedJobs = [];
+      const visibleJobs = [];
+      animationJobs.forEach(animationJob => {
+        if (!isOTPAnimationJobCurrent(animationJob)) {
+          animationJob.cancelled = true;
+          return;
+        }
+
+        if (!isOTPElementInViewport(animationJob.otpElement) &&
+            !isOTPElementInViewport(animationJob.nextOtpElement)) {
+          animationJob.cancelled = true;
+          return;
+        }
+
+        visibleJobs.push(animationJob);
+      });
+
+      // 先统一移除旧状态，再集中读取几何，最后统一写入动画 class，避免交替触发布局刷新。
+      visibleJobs.forEach(animationJob => {
+        const animationConfig = OTP_ANIMATION_CONFIG[animationJob.animationMode];
+        clearOTPAnimationTimer(animationJob.otpElement);
+        clearOTPAnimationTimer(animationJob.nextOtpElement);
+        removeOTPAnimationClass(animationJob.otpElement, animationConfig.currentClass);
+        removeOTPAnimationClass(animationJob.nextOtpElement, animationConfig.nextClass);
+      });
+
+      visibleJobs.forEach(animationJob => {
+
+        const animationConfig = OTP_ANIMATION_CONFIG[animationJob.animationMode];
+        const geometry = captureOTPPromotionGeometry(
+          animationJob.otpElement,
+          animationJob.nextOtpElement,
+          animationConfig.needsTargetGeometry
+        );
+        if (geometry) preparedJobs.push({ animationJob, geometry });
+      });
+
+      // 所有几何读取完成后再统一写入 DOM，避免多卡片之间交替触发布局刷新
+      preparedJobs.forEach(({ animationJob, geometry }) => {
+        startOTPPromotionAnimation(animationJob, geometry);
+      });
+    }
+
+    function scheduleQueuedOTPAnimationFlush() {
+      if (otpAnimationReadFrameScheduled) return;
+      otpAnimationReadFrameScheduled = true;
+      const frameId = requestOTPAnimationFrame(flushQueuedOTPAnimations);
+      if (otpAnimationReadFrameScheduled) {
+        otpAnimationReadFrameId = frameId;
+      }
+    }
+
+    function queueOTPPromotionAnimation(animationJob) {
+      clearOTPAnimationTimer(animationJob.otpElement);
+      clearOTPAnimationTimer(animationJob.nextOtpElement);
+      animationJob.cancelled = false;
+      animationJob.elements = [animationJob.otpElement, animationJob.nextOtpElement];
+      animationJob.elements.forEach(element => otpQueuedAnimationJobs.set(element, animationJob));
+      queuedOTPAnimationJobs.add(animationJob);
+      scheduleQueuedOTPAnimationFlush();
+    }
+
+    // 执行一次稳定窗口更新。计算期间跨过窗口或时钟重新同步时，丢弃结果并重试，
+    // 避免旧结果触发错误的交接动画。
+    function isCurrentOTPUpdateRequest(secretId, request) {
+      return !request || otpUpdateInFlight.get(secretId) === request;
+    }
+
+    async function performOTPUpdate(secretId, request = null) {
       const secret = secrets.find(s => s.id === secretId);
       if (!secret) return;
 
-      try {
-        const currentTime = Math.floor(getCorrectedNowMs() / 1000);
-        const timeStep = secret.period || 30;
-        const isHOTP = secret.type && secret.type.toUpperCase() === 'HOTP';
-        const clockGeneration = isHOTP ? null : getTrustedClockGeneration();
-        const currentWindow = otpCalculator.getCurrentTimeWindow(timeStep);
-        const nextWindow = otpCalculator.getNextTimeWindow(timeStep);
+      const timeStep = secret.period || 30;
+      const isHOTP = secret.type && secret.type.toUpperCase() === 'HOTP';
+      const maxAttempts = isHOTP ? 1 : 3;
 
-        console.log('更新OTP:', secret.name, '当前时间窗口:', currentWindow, '下一个时间窗口:', nextWindow, '时间:', new Date(currentTime * 1000).toLocaleTimeString());
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        try {
+          const currentTime = Math.floor(getCorrectedNowMs() / 1000);
+          const clockGeneration = isHOTP ? null : getTrustedClockGeneration();
+          const currentWindow = otpCalculator.getCurrentTimeWindow(timeStep);
+          const nextWindow = otpCalculator.getNextTimeWindow(timeStep);
 
-        // 并行计算当前和下一个OTP
-        const [currentToken, nextToken] = await Promise.all([
-          otpCalculator.calculateCurrentOTP(secret),
-          otpCalculator.calculateNextOTP(secret)
-        ]);
+          console.log('更新OTP:', secret.name, '当前时间窗口:', currentWindow, '下一个时间窗口:', nextWindow, '时间:', new Date(currentTime * 1000).toLocaleTimeString());
 
-        if (!isHOTP) {
-          if (clockGeneration !== getTrustedClockGeneration()) return;
-          if (currentWindow !== otpCalculator.getCurrentTimeWindow(timeStep)) {
-            return updateOTP(secretId);
+          // 并行计算当前和下一个OTP
+          const [currentToken, nextToken] = await Promise.all([
+            otpCalculator.calculateCurrentOTP(secret),
+            otpCalculator.calculateNextOTP(secret)
+          ]);
+
+          // 如果同一张卡随后以新的窗口/时钟代次发起了请求，旧结果只能丢弃。
+          if (!isCurrentOTPUpdateRequest(secretId, request)) return;
+
+          if (!isHOTP) {
+            if (clockGeneration !== getTrustedClockGeneration()) continue;
+            if (currentWindow !== otpCalculator.getCurrentTimeWindow(timeStep)) continue;
           }
-        }
 
-        // 在提交前读取旧的下一个验证码，用于确认它是否正好晋升为当前验证码
-        const otpElement = document.getElementById('otp-' + secretId);
-        const nextOtpElement = document.getElementById('next-otp-' + secretId);
-        const previousNextToken = nextOtpElement ? nextOtpElement.textContent : null;
-        const previousTransitionState = !isHOTP && otpElement ? otpTransitionStates.get(otpElement) : null;
-        const animationMode = getOTPAnimationMode();
+          // 在提交前读取旧的下一个验证码，用于确认它是否正好晋升为当前验证码
+          const otpElement = document.getElementById('otp-' + secretId);
+          const nextOtpElement = document.getElementById('next-otp-' + secretId);
+          const previousCurrentToken = otpElement ? otpElement.textContent : null;
+          const previousNextToken = nextOtpElement ? nextOtpElement.textContent : null;
+          const previousTransitionState = !isHOTP && otpElement ? otpTransitionStates.get(otpElement) : null;
+          const animationMode = getOTPAnimationMode();
 
-        const isOTPWindowPromotion = !!(
-          !isHOTP &&
-          otpElement &&
-          nextOtpElement &&
-          previousTransitionState &&
-          previousTransitionState.window === currentWindow - 1 &&
-          previousTransitionState.period === timeStep &&
-          previousTransitionState.nextToken === previousNextToken &&
-          previousNextToken !== OTP_PLACEHOLDER &&
-          currentToken !== OTP_PLACEHOLDER &&
-          nextToken !== OTP_PLACEHOLDER &&
-          previousNextToken === currentToken
-        );
-        const shouldAnimatePromotion = !!(
-          isOTPWindowPromotion &&
-          animationMode !== 'none' &&
-          !prefersReducedOTPMotion()
-        );
-        const promotionGeometry = shouldAnimatePromotion
-          ? captureOTPPromotionGeometry(
-              otpElement,
-              nextOtpElement,
-              OTP_ANIMATION_CONFIG[animationMode].needsTargetGeometry
-            )
-          : null;
+          const isOTPWindowPromotion = !!(
+            !isHOTP &&
+            otpElement &&
+            nextOtpElement &&
+            previousTransitionState &&
+            previousTransitionState.window === currentWindow - 1 &&
+            previousTransitionState.period === timeStep &&
+            previousTransitionState.nextToken === previousNextToken &&
+            previousNextToken !== OTP_PLACEHOLDER &&
+            currentToken !== OTP_PLACEHOLDER &&
+            nextToken !== OTP_PLACEHOLDER &&
+            previousNextToken === currentToken
+          );
+          const shouldQueuePromotion = !!(
+            isOTPWindowPromotion &&
+            animationMode !== 'none' &&
+            isOTPAnimationDocumentVisible() &&
+            !prefersReducedOTPMotion()
+          );
+          const preservesCurrentAnimation = !!(
+            !isHOTP &&
+            previousTransitionState &&
+            previousTransitionState.window === currentWindow &&
+            previousTransitionState.period === timeStep &&
+            previousTransitionState.nextToken === nextToken &&
+            previousCurrentToken === currentToken &&
+            previousNextToken === nextToken
+          );
 
-        // 更新当前OTP显示
-        if (otpElement) {
-          otpElement.textContent = currentToken;
-          console.log('当前OTP更新:', currentToken, '时间窗口:', currentWindow);
-        }
-
-        // 更新下一个OTP显示
-        if (nextOtpElement) {
-          nextOtpElement.textContent = nextToken;
-          console.log('下一个OTP更新:', nextToken, '时间窗口:', nextWindow);
-        }
-
-        if (!isHOTP && otpElement && nextOtpElement) {
-          otpTransitionStates.set(otpElement, {
-            window: currentWindow,
-            period: timeStep,
-            nextToken
-          });
-
-          if (shouldAnimatePromotion && promotionGeometry) {
-            triggerOTPPromotionAnimation(
-              otpElement,
-              nextOtpElement,
-              previousNextToken,
-              animationMode,
-              promotionGeometry
-            );
+          // 同窗同值刷新保留正在播放的动画；任何新状态提交都先撤销旧 flyer/class
+          if (!preservesCurrentAnimation) {
+            clearOTPAnimationTimer(otpElement);
+            clearOTPAnimationTimer(nextOtpElement);
           }
+
+          // 更新当前OTP显示
+          if (otpElement) {
+            otpElement.textContent = currentToken;
+            console.log('当前OTP更新:', currentToken, '时间窗口:', currentWindow);
+          }
+
+          // 更新下一个OTP显示
+          if (nextOtpElement) {
+            nextOtpElement.textContent = nextToken;
+            console.log('下一个OTP更新:', nextToken, '时间窗口:', nextWindow);
+          }
+
+          if (!isHOTP && otpElement && nextOtpElement) {
+            otpTransitionStates.set(otpElement, {
+              window: currentWindow,
+              period: timeStep,
+              nextToken
+            });
+
+            if (shouldQueuePromotion) {
+              queueOTPPromotionAnimation({
+                otpElement,
+                nextOtpElement,
+                previousNextToken,
+                animationMode,
+                currentToken,
+                nextToken,
+                window: currentWindow,
+                period: timeStep,
+                clockGeneration,
+                isHOTP: false
+              });
+            }
+          }
+          return;
+        } catch (error) {
+          console.error('更新OTP失败:', error);
+          return;
         }
-      } catch (error) {
-        console.error('更新OTP失败:', error);
       }
+    }
+
+    function getOTPUpdateContext(secretId) {
+      const secret = secrets.find(s => s.id === secretId);
+      if (!secret) return null;
+
+      const period = secret.period || 30;
+      const isHOTP = secret.type && secret.type.toUpperCase() === 'HOTP';
+      return {
+        secretFingerprint: JSON.stringify([
+          secret.secret,
+          secret.type,
+          secret.digits,
+          secret.algorithm,
+          secret.counter,
+          secret.period
+        ]),
+        period,
+        window: isHOTP ? null : otpCalculator.getCurrentTimeWindow(period),
+        clockGeneration: isHOTP ? null : getTrustedClockGeneration(),
+        requestGeneration: otpUpdateRequestGeneration
+      };
+    }
+
+    function isSameOTPUpdateContext(left, right) {
+      return !!(
+        left &&
+        right &&
+        left.secretFingerprint === right.secretFingerprint &&
+        left.period === right.period &&
+        left.window === right.window &&
+        left.clockGeneration === right.clockGeneration &&
+        left.requestGeneration === right.requestGeneration
+      );
+    }
+
+    // 倒计时、安全检查、焦点恢复可能在同一时刻请求同一张卡；相同窗口复用同一个 Promise。
+    // 如果窗口或时钟代次已经改变，则允许新请求取代旧请求，旧结果会在提交前被丢弃。
+    function updateOTP(secretId) {
+      const context = getOTPUpdateContext(secretId);
+      if (!context) return Promise.resolve();
+
+      const existing = otpUpdateInFlight.get(secretId);
+      if (existing && isSameOTPUpdateContext(existing, context)) {
+        return existing.promise;
+      }
+
+      const request = {
+        ...context,
+        promise: null
+      };
+      request.promise = performOTPUpdate(secretId, request);
+      otpUpdateInFlight.set(secretId, request);
+      request.promise.then(
+        () => {
+          if (otpUpdateInFlight.get(secretId) === request) {
+            otpUpdateInFlight.delete(secretId);
+          }
+        },
+        () => {
+          if (otpUpdateInFlight.get(secretId) === request) {
+            otpUpdateInFlight.delete(secretId);
+          }
+        }
+      );
+      return request.promise;
+    }
+
+    function hasOTPInterval(secretId) {
+      return !!(
+        otpIntervals &&
+        Object.prototype.hasOwnProperty.call(otpIntervals, String(secretId))
+      );
+    }
+
+    function isCommittedOTPValue(element) {
+      const value = element ? String(element.textContent || '') : '';
+      return !!value && value !== OTP_PLACEHOLDER && !/^[-]+$/.test(value);
+    }
+
+    function getCommittedOTPWindow(secretId, period) {
+      const otpElement = document.getElementById('otp-' + secretId);
+      const nextOtpElement = document.getElementById('next-otp-' + secretId);
+      const transitionState = otpElement ? otpTransitionStates.get(otpElement) : null;
+      if (
+        !transitionState ||
+        transitionState.period !== period ||
+        !isCommittedOTPValue(otpElement) ||
+        !isCommittedOTPValue(nextOtpElement)
+      ) {
+        return null;
+      }
+      return transitionState.window;
+    }
+
+    function hasCommittedOTPWindow(secretId, period, currentWindow) {
+      return getCommittedOTPWindow(secretId, period) === currentWindow;
+    }
+
+    function stopOTPWindowScheduler() {
+      if (!otpWindowSchedulerRunning) return;
+
+      if (
+        otpWindowSchedulerTimer !== null &&
+        otpWindowSchedulerTimer !== true &&
+        typeof clearInterval === 'function'
+      ) {
+        clearInterval(otpWindowSchedulerTimer);
+      }
+      otpWindowSchedulerTimer = null;
+      otpWindowSchedulerRunning = false;
+    }
+
+    function clearOTPWindowScheduler() {
+      stopOTPWindowScheduler();
+      otpWindowSchedulerEntries.clear();
+      otpUpdateRequestGeneration += 1;
+      otpUpdateInFlight.clear();
+    }
+
+    function runOTPWindowScheduler() {
+      if (typeof document !== 'undefined' && document.hidden) {
+        stopOTPWindowScheduler();
+        return;
+      }
+
+      const refreshGroups = new Map();
+      const currentWindowsByPeriod = new Map();
+      for (const [entryKey, entry] of otpWindowSchedulerEntries) {
+        if (!hasOTPInterval(entry.secretId)) {
+          otpWindowSchedulerEntries.delete(entryKey);
+          continue;
+        }
+
+        const secret = secrets.find(s => String(s.id) === entryKey);
+        if (!secret || (secret.type && secret.type.toUpperCase() === 'HOTP')) {
+          otpWindowSchedulerEntries.delete(entryKey);
+          continue;
+        }
+
+        const period = secret.period || 30;
+        let currentWindow = currentWindowsByPeriod.get(period);
+        if (typeof currentWindow === 'undefined') {
+          currentWindow = otpCalculator.getCurrentTimeWindow(period);
+          currentWindowsByPeriod.set(period, currentWindow);
+        }
+        entry.period = period;
+        if (entry.lastWindow === null) {
+          entry.lastWindow = currentWindow;
+          entry.pendingWindow = null;
+          continue;
+        }
+        if (entry.pendingWindow === currentWindow) continue;
+        // 安全检查或焦点恢复可能已经提交了这一窗口，避免再次启动计算/动画。
+        if (hasCommittedOTPWindow(entry.secretId, period, currentWindow)) {
+          entry.lastWindow = currentWindow;
+          entry.pendingWindow = null;
+          continue;
+        }
+        // lastWindow 相同但 DOM 仍是占位符/旧值时，允许在当前窗口重试。
+        if (entry.lastWindow === currentWindow && entry.pendingWindow !== null) continue;
+
+        const groupKey = String(period);
+        if (!refreshGroups.has(groupKey)) refreshGroups.set(groupKey, []);
+        entry.pendingWindow = currentWindow;
+        refreshGroups.get(groupKey).push({ entry, secretId: entry.secretId, period, window: currentWindow });
+      }
+
+      // 同一 tick 内同步发起全部候选，后续的 RAF 队列会把完成的交接合并到一帧。
+      refreshGroups.forEach(refreshEntries => {
+        refreshEntries.forEach(({ entry, secretId, period, window }) => {
+          let updatePromise;
+          try {
+            updatePromise = updateOTP(secretId);
+          } catch (error) {
+            entry.pendingWindow = null;
+            console.warn('调度OTP窗口更新失败:', error);
+            return;
+          }
+
+          Promise.resolve(updatePromise).then(() => {
+            if (
+              otpWindowSchedulerEntries.get(String(secretId)) !== entry ||
+              entry.pendingWindow !== window
+            ) {
+              return;
+            }
+
+            entry.pendingWindow = null;
+            if (hasCommittedOTPWindow(secretId, period, window)) {
+              entry.lastWindow = window;
+            }
+          }, () => {
+            if (
+              otpWindowSchedulerEntries.get(String(secretId)) === entry &&
+              entry.pendingWindow === window
+            ) {
+              entry.pendingWindow = null;
+            }
+          });
+        });
+      });
+
+      if (otpWindowSchedulerEntries.size === 0) stopOTPWindowScheduler();
+    }
+
+    function startOTPWindowScheduler() {
+      if (
+        otpWindowSchedulerRunning ||
+        typeof setInterval !== 'function' ||
+        (typeof document !== 'undefined' && document.hidden)
+      ) return;
+
+      try {
+        const timer = setInterval(runOTPWindowScheduler, OTP_WINDOW_SCHEDULER_TICK_MS);
+        // 测试或嵌入环境的 setInterval 可能不返回句柄；running 标记仍需生效，避免重复注册。
+        otpWindowSchedulerTimer = typeof timer === 'undefined' ? true : timer;
+        otpWindowSchedulerRunning = true;
+      } catch (error) {
+        console.warn('启动OTP窗口调度器失败:', error);
+      }
+    }
+
+    function isOTPWindowScheduled(secretId) {
+      return otpWindowSchedulerRunning && otpWindowSchedulerEntries.has(String(secretId));
+    }
+
+    function registerOTPWindow(secretId) {
+      const secret = secrets.find(s => s.id === secretId);
+      if (!secret || (secret.type && secret.type.toUpperCase() === 'HOTP')) return;
+
+      const entryKey = String(secretId);
+      const period = secret.period || 30;
+      const currentWindow = otpCalculator.getCurrentTimeWindow(period);
+      const committedWindow = getCommittedOTPWindow(secretId, period);
+      const initialWindow = committedWindow === null ? currentWindow : committedWindow;
+      const existing = otpWindowSchedulerEntries.get(entryKey);
+      if (existing) {
+        existing.secretId = secretId;
+        existing.lastWindow = initialWindow;
+        existing.period = period;
+        existing.pendingWindow = null;
+      } else {
+        otpWindowSchedulerEntries.set(entryKey, {
+          secretId,
+          period,
+          lastWindow: initialWindow,
+          pendingWindow: null
+        });
+      }
+      startOTPWindowScheduler();
+    }
+
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('beforeunload', stopOTPWindowScheduler);
     }
 
     // 计算下一个OTP（保持向后兼容）
@@ -802,10 +1265,16 @@ export function getOTPCode() {
 
       // HOTP 不需要倒计时，直接返回
       if (secret.type && secret.type.toUpperCase() === 'HOTP') {
+        if (otpIntervals && Object.prototype.hasOwnProperty.call(otpIntervals, String(secretId))) {
+          clearInterval(otpIntervals[secretId]);
+          delete otpIntervals[secretId];
+        }
+        otpWindowSchedulerEntries.delete(String(secretId));
+        if (otpWindowSchedulerEntries.size === 0) stopOTPWindowScheduler();
         return;
       }
 
-      if (otpIntervals[secretId]) {
+      if (otpIntervals && Object.prototype.hasOwnProperty.call(otpIntervals, String(secretId))) {
         clearInterval(otpIntervals[secretId]);
       }
 
@@ -813,6 +1282,7 @@ export function getOTPCode() {
         updateCountdown(secretId);
       }, 1000);
 
+      registerOTPWindow(secretId);
       updateCountdown(secretId);
     }
 
@@ -848,26 +1318,14 @@ export function getOTPCode() {
 
       // 🔄 防御性检查：如果验证码显示为默认值，立即刷新
       const otpElement = document.getElementById('otp-' + secretId);
-      if (otpElement && otpElement.textContent === '------') {
+      if (otpElement && otpElement.textContent === '------' && !isOTPWindowScheduled(secretId)) {
         console.warn('⚠️  检测到验证码未初始化，立即刷新:', secret.name);
         updateOTP(secretId);
       }
 
-      if (remaining === 0) {
-        // 倒计时结束时，立即更新OTP
+      if (remaining === 0 && !isOTPWindowScheduled(secretId)) {
+        // 只有共享调度器不可用时才由单卡兜底，避免抢先触发交接动画。
         updateOTP(secretId);
-        // 重新启动倒计时
-        if (otpIntervals[secretId]) {
-          updateCountdown(secretId);
-        }
-      } else if (remaining === 1) {
-        // 倒计时即将结束时，提前准备刷新
-        setTimeout(() => {
-          if (otpIntervals[secretId]) {
-            updateOTP(secretId);
-            updateCountdown(secretId);
-          }
-        }, 1000);
       }
     }
 `;
